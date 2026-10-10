@@ -3,6 +3,7 @@ package fi.dy.masa.litematica.util;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 import javax.annotation.Nullable;
 import org.apache.commons.lang3.tuple.Pair;
 import org.jetbrains.annotations.ApiStatus;
@@ -10,6 +11,7 @@ import org.jetbrains.annotations.ApiStatus;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.NonNullList;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.Container;
@@ -20,6 +22,7 @@ import net.minecraft.world.inventory.AbstractContainerMenu;
 import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.inventory.Slot;
+import net.minecraft.world.item.component.CustomData;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.Block;
@@ -46,6 +49,7 @@ import fi.dy.masa.litematica.world.WorldSchematic;
 
 public class InventoryUtils
 {
+    private static final String SERVER_LORE_CUSTOM_DATA_KEY = "citadelleeconomie:lore";
     private static final List<Integer> PICK_BLOCKABLE_SLOTS = new ArrayList<>();
     private static int nextPickSlotIndex;
     private static Pair<BlockPos, InventoryOverlayContext> lastBlockEntityContext = null;
@@ -74,7 +78,7 @@ public class InventoryUtils
     public static void setPickedItemToHand(ItemStack stack, Minecraft mc)
     {
         if (mc.player == null) return;
-        int slotNum = mc.player.getInventory().findSlotMatchingItem(stack);
+        int slotNum = findSlotMatchingPickBlockItem(mc.player.getInventory(), stack);
         setPickedItemToHand(slotNum, stack, mc);
     }
 
@@ -118,7 +122,18 @@ public class InventoryUtils
                 }
                 else
                 {
-                    fi.dy.masa.malilib.util.InventoryUtils.swapItemToMainHand(stack.copy(), mc);
+                    // Reuse the matched slot; a stack-based rescan would compare all components again.
+                    OptionalInt sourceMenuSlot = player.inventoryMenu.findSlot(inventory, sourceSlot);
+
+                    if (sourceMenuSlot.isPresent())
+                    {
+                        mc.gameMode.handleContainerInput(player.inventoryMenu.containerId,
+                                sourceMenuSlot.getAsInt(), hotbarSlot, ContainerInput.SWAP, player);
+                    }
+                    else if (sourceSlot == -1)
+                    {
+                        fi.dy.masa.malilib.util.InventoryUtils.swapItemToMainHand(stack.copy(), mc);
+                    }
                 }
 
                 EasyPlaceUtils.setEasyPlaceLastPickBlockTime();
@@ -139,7 +154,7 @@ public class InventoryUtils
 	public static int getPickedItemHandSlotNoSwap(ItemStack stack, Minecraft mc)
 	{
 		if (mc.player == null) return -1;
-		int slotNum = mc.player.getInventory().findSlotMatchingItem(stack);
+        int slotNum = findSlotMatchingPickBlockItem(mc.player.getInventory(), stack);
 		return getPickedItemHandSlotNoSwap(slotNum, stack, mc);
 	}
 
@@ -191,7 +206,7 @@ public class InventoryUtils
 				}
 				else
 				{
-					resultSlot = getMainHandSlotForItem(stack.copy(), mc);
+                    resultSlot = getMainHandSlotForItem(sourceSlot, stack.copy(), mc);
 				}
 
 				// Can still be -1
@@ -217,7 +232,7 @@ public class InventoryUtils
 	 * @param mc ()
 	 * @return (The Slot ID or -1)
 	 */
-	private static int getMainHandSlotForItem(ItemStack stackReference, Minecraft mc)
+    private static int getMainHandSlotForItem(int sourceSlot, ItemStack stackReference, Minecraft mc)
 	{
 		Player player = mc.player;
 		if (mc.player == null) return -1;
@@ -235,7 +250,8 @@ public class InventoryUtils
 		}
 		else
 		{
-			return fi.dy.masa.malilib.util.InventoryUtils.findSlotWithItem(player.inventoryMenu, stackReference, true);
+            OptionalInt slot = player.inventoryMenu.findSlot(player.getInventory(), sourceSlot);
+            return slot.orElse(-1);
 		}
 	}
 
@@ -272,12 +288,12 @@ public class InventoryUtils
             }
             else
             {
-                int slot = inv.findSlotMatchingItem(stack);
+                int slot = findSlotMatchingPickBlockItem(inv, stack);
                 boolean shouldPick = inv.getSelectedSlot() != slot;
 
                 if (shouldPick && slot != -1)
                 {
-                    setPickedItemToHand(stack, mc);
+                    setPickedItemToHand(slot, stack, mc);
                 }
                 else if (slot == -1 && Configs.Generic.PICK_BLOCK_SHULKERS.getBooleanValue())
                 {
@@ -293,6 +309,54 @@ public class InventoryUtils
                 //return shouldPick == false || canPick;
             }
         }
+    }
+
+    private static int findSlotMatchingPickBlockItem(Inventory inventory, ItemStack referenceStack)
+    {
+        ItemStack referenceForComparison = getPickBlockComparisonCopy(referenceStack);
+        NonNullList<ItemStack> items = inventory.getNonEquipmentItems();
+
+        for (int slot = 0; slot < items.size(); ++slot)
+        {
+            ItemStack item = items.get(slot);
+            ItemStack itemForComparison = getPickBlockComparisonCopy(item);
+
+            if (ItemStack.isSameItemSameComponents(referenceForComparison, itemForComparison))
+            {
+                return slot;
+            }
+        }
+
+        return -1;
+    }
+
+    private static ItemStack getPickBlockComparisonCopy(ItemStack stack)
+    {
+        ItemStack copy = stack.copy();
+        copy.remove(DataComponents.LORE);
+        // Ignore only the server's lore marker; other custom data remains significant.
+        CustomData customData = copy.get(DataComponents.CUSTOM_DATA);
+
+        if (customData != null)
+        {
+            CompoundTag tag = customData.copyTag();
+
+            if (tag.contains(SERVER_LORE_CUSTOM_DATA_KEY))
+            {
+                tag.remove(SERVER_LORE_CUSTOM_DATA_KEY);
+
+                if (tag.isEmpty())
+                {
+                    copy.remove(DataComponents.CUSTOM_DATA);
+                }
+                else
+                {
+                    copy.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
+                }
+            }
+        }
+
+        return copy;
     }
 
     private static boolean canPickToSlot(Inventory inventory, int slotNum)
